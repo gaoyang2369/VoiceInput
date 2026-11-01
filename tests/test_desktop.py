@@ -7,7 +7,7 @@ import tkinter as tk
 import unittest
 from unittest.mock import patch
 
-from desktop import GlobalShortcut, StatusPopup, user32
+from desktop import GlobalShortcut, StatusPopup, AnswerWindow, user32
 
 
 class ShortcutTests(unittest.TestCase):
@@ -59,8 +59,81 @@ class ShortcutTests(unittest.TestCase):
             shortcut.stop()
         self.assertFalse(shortcut.thread.is_alive())
 
+    def test_translation_both_press_and_release_orders(self):
+        for press in ((0xA5, 0xA1), (0xA1, 0xA5)):
+            for release in (press, tuple(reversed(press))):
+                with self.subTest(press=press, release=release):
+                    modes, bare = [], []
+                    shortcut = GlobalShortcut(lambda: bare.append(True), self.fail, mode_callback=modes.append)
+                    for key in press:
+                        shortcut.key_event(key, False)
+                    shortcut.key_event(release[0], True)
+                    self.assertEqual(modes, [])
+                    shortcut.key_event(release[1], True)
+                    self.assertEqual(modes, ['translate'])
+                    self.assertEqual(bare, [])
+
+    def test_ask_repeat_does_not_insert_space_or_start_dictation(self):
+        modes = []
+        self.shortcut.mode_callback = modes.append
+        self.assertTrue(self.shortcut.key_event(0xA5, False))
+        for _ in range(6):
+            self.assertTrue(self.shortcut.key_event(0x20, False))
+        self.assertTrue(self.shortcut.key_event(0xA5, True))
+        self.assertEqual(modes, [])
+        self.assertTrue(self.shortcut.key_event(0x20, True))
+        self.assertEqual(modes, ['ask'])
+        self.assertEqual(self.fired, [])
+
+    def test_extra_key_cancels_recognized_chord(self):
+        modes = []
+        self.shortcut.mode_callback = modes.append
+        for key in (0xA5, 0xA1, 0x41):
+            self.shortcut.key_event(key, False)
+        for key in (0x41, 0xA1, 0xA5):
+            self.shortcut.key_event(key, True)
+        self.assertEqual(modes, [])
+        self.assertEqual(self.fired, [])
+
+    def test_left_shift_does_not_translate(self):
+        modes = []
+        self.shortcut.mode_callback = modes.append
+        with patch.object(user32, 'keybd_event'):
+            for key in (0xA5, 0xA0):
+                self.shortcut.key_event(key, False)
+            for key in (0xA0, 0xA5):
+                self.shortcut.key_event(key, True)
+        self.assertEqual(modes, [])
+        self.assertEqual(self.fired, [])
+
 
 class PopupTests(unittest.TestCase):
+    def test_answer_window_contains_selectable_answer_and_reopens(self):
+        root = tk.Tk()
+        root.withdraw()
+        answer = AnswerWindow(root)
+        try:
+            result = '第一点：测试全部通过。\n第二点：周五上线。'
+            answer.show('上线条件是什么？', '上下文\n' * 200, result)
+            answer.window.withdraw()
+            root.update_idletasks()
+            def texts(widget):
+                for child in widget.winfo_children():
+                    if isinstance(child, tk.Text):
+                        yield child
+                    yield from texts(child)
+            output = list(texts(answer.window))
+            self.assertEqual(len(output), 1)
+            self.assertEqual(output[0].get('1.0', 'end-1c'), result)
+            self.assertEqual(output[0]['state'], 'disabled')
+            previous = answer.window
+            answer.show('新问题', '新材料', '新答案')
+            answer.window.withdraw()
+            self.assertFalse(previous.winfo_exists())
+        finally:
+            answer.close()
+            root.destroy()
+
     def test_visible_noactivate_buttons_timer_and_render(self):
         root = tk.Tk()
         root.withdraw()

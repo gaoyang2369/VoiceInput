@@ -4,6 +4,7 @@ from ctypes import wintypes as w
 import threading
 import math
 import tkinter as tk
+from tkinter import ttk
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 LRESULT = ctypes.c_ssize_t
@@ -49,6 +50,7 @@ class StatusPopup:
         self.animation_timer = None
         self.mode = 'message'
         self.phase = 0
+        self.workflow = 'dictate'
         self.window = tk.Toplevel(root)
         self.window.withdraw()
         self.window.overrideredirect(True)
@@ -104,11 +106,16 @@ class StatusPopup:
             d.ellipse(box((152, 14, 188, 50)), fill='white')
             line((23, 25, 37, 39)); line((37, 25, 23, 39))
             line((162, 32, 168, 38, 179, 26), '#111111', 3)
-            for i in range(11):
+            special = getattr(self, 'workflow', 'dictate') != 'dictate'
+            if special:
+                badge = 'EN' if self.workflow == 'translate' else '?'
+                font = ImageFont.truetype('C:/Windows/Fonts/segoeui.ttf', 10 * scale)
+                d.text((70 * scale, 32 * scale), badge, font=font, fill='#cccccc', anchor='mm')
+            for i in range(8 if special else 11):
                 # Silent input stays low; movement is driven by actual microphone RMS.
                 envelope = 0.4 + 0.6 * abs(math.sin(self.phase * 0.7 + i * 1.8))
                 h = 4 + min(1, level) * 23 * envelope
-                x = 67 + i * 6
+                x = (84 if special else 67) + i * 6
                 d.rounded_rectangle(box((x, 32 - h / 2, x + 3, 32 + h / 2)),
                                     radius=scale, fill='white')
         elif self.mode in ('processing', 'complete'):
@@ -212,49 +219,67 @@ class StatusPopup:
 
 
 class GlobalShortcut:
-    def __init__(self, callback, error, ready=None):
+    def __init__(self, callback, error, ready=None, mode_callback=None):
         self.callback, self.error, self.ready = callback, error, ready
+        self.mode_callback = mode_callback
         self.thread_id = None
         self.thread = None
         self.stopping = threading.Event()
         self.down = False
-        self.used = False
         self.forwarded = False
         self.held = set()
+        self.consumed = set()
+        self.action = None
+        self.action_keys = set()
 
     def start(self):
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
     def key_event(self, vk, up):
-        """Reserve a bare Right Alt tap; restore Right Alt for actual key chords."""
-        if vk == 0xA5:
-            if not up:
-                if not self.down:
-                    self.down = True
-                    self.used = bool(self.held)
-                    self.forwarded = self.used
-                    return not self.forwarded
-                return not self.forwarded  # ignore key auto-repeat
-            if not self.down:
-                return False
-            fire, consume = not self.used, not self.forwarded
-            self.down = False
-            self.used = False
-            self.forwarded = False
-            if fire:
-                self.callback()
-            return consume
+        """Commit one exact shortcut only after all its keys are released."""
         if up:
             self.held.discard(vk)
-        else:
-            self.held.add(vk)
-            if self.down:
-                self.used = True
-                if not self.forwarded:
-                    self.forwarded = True
-                    # Right Alt was withheld until we knew this was a chord.
-                    user32.keybd_event(0xA5, 0x38, 0x1, 0)
+            consume = vk in self.consumed
+            self.consumed.discard(vk)
+            if vk == 0xA5:
+                self.down = False
+                self.forwarded = False
+            if self.action and not self.action_keys.intersection(self.held):
+                action = self.action
+                self.action = None
+                self.action_keys = set()
+                if action == 'dictate':
+                    self.callback()
+                elif self.mode_callback:
+                    self.mode_callback(action)
+            return consume
+        if vk in self.held:
+            return vk in self.consumed
+        previous = self.held.copy()
+        self.held.add(vk)
+        if vk == 0xA5:
+            self.down = True
+            self.forwarded = bool(previous - {0xA1})
+            if not previous or previous == {0xA1}:
+                self.action = 'translate' if previous else 'dictate'
+                self.action_keys = {0xA5, 0xA1} if previous else {0xA5}
+                self.consumed.add(vk)
+                return True
+            return False
+        if self.action == 'dictate' and previous == {0xA5} and vk in (0xA1, 0x20):
+            self.action = 'translate' if vk == 0xA1 else 'ask'
+            self.action_keys = {0xA5, vk}
+            self.consumed.add(vk)
+            return True
+        if self.action:
+            was_dictation = self.action == 'dictate'
+            self.action = None
+            self.action_keys = set()
+            if was_dictation and self.down and not self.forwarded:
+                self.forwarded = True
+                self.consumed.discard(0xA5)
+                user32.keybd_event(0xA5, 0x38, 0x1, 0)
         return False
 
     def run(self):
@@ -279,6 +304,8 @@ class GlobalShortcut:
                     vk = data.vkCode
                     if vk == 0x12 and data.flags & 0x1:
                         vk = 0xA5
+                    elif vk == 0x10:
+                        vk = 0xA1 if data.scanCode == 0x36 else 0xA0
                     if self.key_event(vk, bool(data.flags & 0x80)):
                         return 1
             return user32.CallNextHookEx(None, code, wp, lp)
@@ -309,6 +336,52 @@ class GlobalShortcut:
             self.thread.join(timeout=1)
 
 
+class AnswerWindow:
+    """Answers appear separately so the original selected text stays intact."""
+    def __init__(self, root):
+        self.root = root
+        self.window = None
+
+    def show(self, question, context, answer):
+        import pyperclip
+        if self.window is not None and self.window.winfo_exists():
+            self.window.destroy()
+        self.window = tk.Toplevel(self.root)
+        self.window.title('轻声输入 · 选中文本问答')
+        self.window.geometry('580x500')
+        self.window.minsize(400, 320)
+        panel = ttk.Frame(self.window, padding=18)
+        panel.pack(fill='both', expand=True)
+        ttk.Label(panel, text='选中文本问答', font=('Microsoft YaHei UI', 16, 'bold')).pack(anchor='w')
+        preview = context.replace('\n', ' ')[:180] + ('…' if len(context) > 180 else '')
+        context_label = ttk.Label(panel, text='所选内容：' + preview, wraplength=510, foreground='#666666')
+        context_label.pack(anchor='w', pady=(8, 6))
+        question_label = ttk.Label(panel, text='问题：' + question.replace('\n', ' ')[:200], wraplength=510)
+        question_label.pack(anchor='w', pady=(0, 10))
+        def resize(event):
+            context_label.configure(wraplength=max(240, event.width - 36))
+            question_label.configure(wraplength=max(240, event.width - 36))
+        panel.bind('<Configure>', resize)
+        body = ttk.Frame(panel)
+        body.pack(fill='both', expand=True)
+        output = tk.Text(body, wrap='word', font=('Microsoft YaHei UI', 11), padx=10, pady=10)
+        scroll = ttk.Scrollbar(body, command=output.yview)
+        output.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        output.pack(side='left', fill='both', expand=True)
+        output.insert('1.0', answer)
+        output.configure(state='disabled')
+        buttons = ttk.Frame(panel)
+        buttons.pack(fill='x', pady=(12, 0))
+        ttk.Button(buttons, text='复制答案', command=lambda: pyperclip.copy(answer)).pack(side='left')
+        ttk.Button(buttons, text='关闭', command=self.window.destroy).pack(side='right')
+        self.window.lift()
+
+    def close(self):
+        if self.window is not None and self.window.winfo_exists():
+            self.window.destroy()
+
+
 class Tray:
     def __init__(self, events):
         import pystray
@@ -325,6 +398,8 @@ class Tray:
         self.icon = pystray.Icon('LocalVoiceInput', image, '轻声输入 · 右 Alt 开始 / 结束',
             pystray.Menu(
                 pystray.MenuItem('开始 / 结束录音（右 Alt）', send('hotkey')),
+                pystray.MenuItem('英文翻译（右 Alt + 右 Shift）', send('translate_hotkey')),
+                pystray.MenuItem('选中文本问答（右 Alt + 空格）', send('ask_hotkey')),
                 pystray.MenuItem('打开设置 / 查看上次结果', send('settings'), default=True),
                 pystray.MenuItem('复制上次结果', send('copy_last')),
                 pystray.MenuItem('退出轻声输入', send('quit'))))

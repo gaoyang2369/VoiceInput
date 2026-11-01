@@ -13,8 +13,9 @@ import sounddevice as sd
 import keyring
 import pyperclip
 from pynput import keyboard
-from core import ROOT, Transcriber, cleanup, download_model, model_ready
-from desktop import GlobalShortcut, StatusPopup, Tray
+from core import ROOT, Transcriber, cleanup, translate_english, answer_question, download_model, model_ready
+from desktop import GlobalShortcut, StatusPopup, AnswerWindow, Tray
+from selection import capture_selection
 
 SERVICE = 'LocalVoiceInput.DeepSeek'
 USER = 'api-key'
@@ -38,6 +39,10 @@ class App:
         self.settings_event = None
         self.operation = 0
         self.last_hotkey = 0.0
+        self.workflow = 'dictate'
+        self.selected_text = ''
+        self.last_workflow = 'dictate'
+        self.last_context = ''
         self.key = os.environ.get('DEEPSEEK_API_KEY', '')
         try:
             self.key = keyring.get_password(SERVICE, USER) or self.key
@@ -49,7 +54,7 @@ class App:
         except (OSError, ValueError):
             pass
         root.title('轻声输入 · 本地识别 + DeepSeek')
-        root.geometry('820x740')
+        root.geometry('820x790')
         root.minsize(680, 620)
         style = ttk.Style()
         style.theme_use('clam')
@@ -58,7 +63,7 @@ class App:
         panel = ttk.Frame(root, padding=22)
         panel.pack(fill='both', expand=True)
         ttk.Label(panel, text='轻声输入', font=('Microsoft YaHei UI', 23, 'bold')).pack(anchor='w')
-        ttk.Label(panel, text='录音留在本机 · 仅整理时向 DeepSeek 发送文字').pack(anchor='w', pady=(4, 14))
+        ttk.Label(panel, text='录音留在本机 · 整理 / 英译 / 问答仅向 DeepSeek 发送文字').pack(anchor='w', pady=(4, 14))
         row = ttk.Frame(panel)
         row.pack(fill='x')
         ttk.Label(row, text='DeepSeek 密钥').pack(side='left')
@@ -74,7 +79,7 @@ class App:
         self.polish = tk.BooleanVar(value=settings.get('polish', True))
         self.auto = tk.BooleanVar(value=settings.get('auto_paste', True))
         ttk.Checkbutton(row, text='DeepSeek 整理', variable=self.polish).pack(side='left')
-        ttk.Checkbutton(row, text='快捷键录音后自动粘贴', variable=self.auto).pack(side='left', padx=8)
+        ttk.Checkbutton(row, text='听写 / 翻译后自动粘贴', variable=self.auto).pack(side='left', padx=8)
         row = ttk.Frame(panel)
         row.pack(fill='x', pady=(0, 12))
         ttk.Label(row, text='麦克风').pack(side='left')
@@ -103,24 +108,27 @@ class App:
         ttk.Label(panel, text='识别原文（可编辑）').pack(anchor='w')
         self.raw = tk.Text(panel, height=6, wrap='word', font=('Microsoft YaHei UI', 11), undo=True)
         self.raw.pack(fill='both', expand=True, pady=5)
-        ttk.Label(panel, text='整理结果（自动分段 / 列点）').pack(anchor='w', pady=(6, 0))
+        self.result_caption = tk.StringVar(value='整理结果（自动分段 / 列点）')
+        ttk.Label(panel, textvariable=self.result_caption).pack(anchor='w', pady=(6, 0))
         self.result = tk.Text(panel, height=6, wrap='word', font=('Microsoft YaHei UI', 11), undo=True)
         self.result.pack(fill='both', expand=True, pady=5)
         row = ttk.Frame(panel)
         row.pack(fill='x', pady=8)
-        ttk.Button(row, text='重新整理原文', command=self.retry).pack(side='left')
+        ttk.Button(row, text='重试上次任务', command=self.retry).pack(side='left')
         ttk.Button(row, text='复制原文', command=lambda: self.copy(self.raw)).pack(side='left', padx=8)
         ttk.Button(row, text='复制结果', command=lambda: self.copy(self.result)).pack(side='left')
         ttk.Button(row, text='保存设置并转到后台', command=self.hide_settings).pack(side='right')
-        ttk.Label(panel, text='单独轻按右 Alt 开始，再按一次结束；单次最多 90 秒。\n浮条左侧 × 取消，右侧 ✓ 完成；自动粘贴到原输入窗口。', wraplength=740).pack(anchor='w')
+        ttk.Label(panel, text='右 Alt：听写 · 右 Alt + 右 Shift：英文翻译 · 右 Alt + 空格：选中文本问答\n再按原组合键或单独右 Alt 结束；× 取消，✓ 完成；单次最多 90 秒。\n译文可自动输入；问答显示独立结果窗。翻译和问答始终需要 DeepSeek 密钥。', wraplength=740).pack(anchor='w')
         self.shortcut_status = tk.StringVar(value='右 Alt 全局监听：正在启动…')
         ttk.Label(panel, textvariable=self.shortcut_status).pack(anchor='w')
         self.popup = StatusPopup(root, self.events)
+        self.answer_window = AnswerWindow(root)
         self.tray = Tray(self.events)
         self.tray.start()
-        self.hotkeys = GlobalShortcut(lambda: self.events.put(('hotkey', None)),
+        self.hotkeys = GlobalShortcut(lambda: self.events.put(('hotkey', ('dictate', user32.GetForegroundWindow()))),
                                      lambda msg: self.events.put(('shortcut_error', msg)),
-                                     lambda: self.events.put(('shortcut_ready', None)))
+                                     lambda: self.events.put(('shortcut_ready', None)),
+                                     lambda mode: self.events.put(('hotkey', (mode, user32.GetForegroundWindow()))))
         try:
             self.hotkeys.start()
         except Exception:
@@ -194,7 +202,7 @@ class App:
             self.events.put(('status', '模型准备完成，可以开始录音。'))
         self.background(run)
 
-    def toggle(self, via_hotkey=False):
+    def toggle(self, via_hotkey=False, mode='dictate', context=None, target=None):
         if self.busy:
             self.popup.processing()
             return
@@ -205,9 +213,19 @@ class App:
             self.status.set('请先点击“下载语音模型”。')
             self.popup.show('模型尚未准备好，请从托盘打开设置下载模型。', 6000)
             return
+        if mode in ('translate', 'ask') and not self.key_var.get().strip():
+            self.status.set('英文翻译和选中文本问答需要先保存 DeepSeek 密钥。')
+            self.popup.show('请先在设置中填写 DeepSeek 密钥。', 6000)
+            return
         self.operation += 1
-        self.target = user32.GetForegroundWindow() if via_hotkey else None
-        self.should_paste = bool(via_hotkey and self.auto.get())
+        self.target = target if target is not None else (user32.GetForegroundWindow() if via_hotkey else None)
+        if mode == 'ask' and context is None:
+            self.prepare_question(self.target, self.operation)
+            return
+        self.workflow = mode
+        self.selected_text = context or ''
+        self.popup.workflow = mode
+        self.should_paste = bool(via_hotkey and self.auto.get() and mode != 'ask')
         self.frames = []
         self.audio_warning = False
         self.popup.show('正在打开麦克风…')
@@ -237,8 +255,28 @@ class App:
         self.started = time.monotonic()
         self.record_button.configure(text='结束录音   右 Alt')
         self.download_button.configure(state='disabled')
-        self.status.set('正在录音…')
+        self.status.set(self.recording_status())
         self.popup.listen()
+
+    def recording_status(self):
+        return {'dictate': '正在听写…', 'translate': '正在录音 · 英文翻译…',
+                'ask': '已获取选中文本 · 请说出问题…'}[self.workflow]
+
+    def prepare_question(self, target, operation):
+        self.busy = True
+        self.record_button.configure(state='disabled')
+        self.download_button.configure(state='disabled')
+        self.status.set('正在获取选中文本，请松开快捷键…')
+        self.popup.processing()
+        def run():
+            try:
+                text = capture_selection(target)
+                error = None
+            except Exception as exc:
+                text = ''
+                error = str(exc) if isinstance(exc, RuntimeError) else '无法获取选中文本，请重新选择后重试。'
+            self.events.put(('selection_ready', (operation, target, text, error)))
+        threading.Thread(target=run, daemon=True).start()
 
     def cancel(self):
         if not self.recording:
@@ -249,6 +287,7 @@ class App:
         self.stream.close()
         self.stream = None
         self.frames = []
+        self.selected_text = ''
         self.level['value'] = 0
         self.record_button.configure(text='开始录音   右 Alt')
         self.download_button.configure(state='normal')
@@ -277,6 +316,10 @@ class App:
         self.replace(self.raw, '')
         self.replace(self.result, '')
         do_polish = self.polish.get()
+        workflow, context = self.workflow, self.selected_text
+        self.result_caption.set({'dictate': '整理结果（自动分段 / 列点）',
+                                 'translate': '英文译文', 'ask': '选中文本问答 · 答案'}[workflow])
+        self.last_workflow, self.last_context = workflow, context
         api_key = self.key_var.get().strip()
         model = self.model.get().strip()
         paste = self.should_paste and not self.audio_warning
@@ -294,12 +337,19 @@ class App:
                 self.events.put(('status', '没有识别到文字。'))
                 return
             elapsed = time.monotonic() - start
-            if do_polish:
+            needs_model = do_polish or workflow != 'dictate'
+            if needs_model:
                 self.events.put(('processing', '正在整理文字…'))
-            self.events.put(('status', f'本地识别 {elapsed:.1f} 秒；' + ('DeepSeek 整理中…' if do_polish else '完成。')))
-            final = cleanup(text, api_key, model) if do_polish else text
+            stage = {'dictate': '整理', 'translate': '翻译成英文', 'ask': '回答问题'}[workflow]
+            self.events.put(('status', f'本地识别 {elapsed:.1f} 秒；' + (f'DeepSeek {stage}中…' if needs_model else '完成。')))
+            if workflow == 'translate':
+                final = translate_english(text, api_key, model)
+            elif workflow == 'ask':
+                final = answer_question(text, context, api_key, model)
+            else:
+                final = cleanup(text, api_key, model) if do_polish else text
             self.events.put(('result', final))
-            self.events.put(('done', (final, paste, target, elapsed, self.audio_warning)))
+            self.events.put(('done', (final, paste, target, elapsed, self.audio_warning, workflow, text, context)))
         self.background(run)
 
     def retry(self):
@@ -311,12 +361,18 @@ class App:
             return
         api_key = self.key_var.get().strip()
         model = self.model.get().strip()
-        self.status.set('DeepSeek 整理中…')
+        workflow, context = self.last_workflow, self.last_context
+        self.status.set('DeepSeek 正在重试上次任务…')
         self.popup.processing()
         def run():
-            final = cleanup(text, api_key, model)
+            if workflow == 'translate':
+                final = translate_english(text, api_key, model)
+            elif workflow == 'ask':
+                final = answer_question(text, context, api_key, model)
+            else:
+                final = cleanup(text, api_key, model)
             self.events.put(('result', final))
-            self.events.put(('polished', None))
+            self.events.put(('polished', (workflow, text, context, final)))
         self.background(run)
 
     def copy(self, widget):
@@ -343,10 +399,30 @@ class App:
                 kind, data = self.events.get_nowait()
             except queue.Empty:
                 break
-            if kind == 'hotkey':
+            if kind in ('hotkey', 'translate_hotkey', 'ask_hotkey'):
                 if time.monotonic() - self.last_hotkey >= 0.35:
                     self.last_hotkey = time.monotonic()
-                    self.toggle(via_hotkey=True)
+                    mode = {'translate_hotkey': 'translate', 'ask_hotkey': 'ask'}.get(kind, data or 'dictate')
+                    target = None
+                    if isinstance(mode, tuple):
+                        mode, target = mode
+                    if target is not None and user32.GetForegroundWindow() != target:
+                        self.popup.show('输入窗口已切换，请重新触发快捷键。', 4000)
+                    else:
+                        self.toggle(via_hotkey=True, mode=mode, target=target)
+            elif kind == 'selection_ready':
+                operation, target, text, error = data
+                if operation != self.operation:
+                    continue
+                self.busy = False
+                self.record_button.configure(state='normal')
+                self.download_button.configure(state='normal')
+                if error or user32.GetForegroundWindow() != target:
+                    message = error or '输入窗口已切换，请重新选择文本后重试。'
+                    self.status.set(message)
+                    self.popup.show(message, 7000)
+                else:
+                    self.toggle(via_hotkey=True, mode='ask', context=text, target=target)
             elif kind == 'settings':
                 self.show_settings()
             elif kind == 'cancel':
@@ -366,12 +442,15 @@ class App:
                 self.status.set(data)
                 self.popup.show(data, 10000)
             elif kind == 'shortcut_ready':
-                self.shortcut_status.set('右 Alt 全局监听：已就绪（单独轻按并松开）')
+                self.shortcut_status.set('三个全局快捷键：已就绪（轻按后松开全部按键）')
             elif kind == 'processing':
                 self.popup.processing()
             elif kind == 'polished':
-                self.status.set('整理完成，可复制结果。')
+                workflow, question, context, final = data
+                self.status.set('处理完成，可复制结果。')
                 self.popup.complete()
+                if workflow == 'ask':
+                    self.answer_window.show(question, context, final)
             elif kind == 'status' or kind == 'error':
                 self.status.set(data)
                 if kind == 'error' or not self.busy:
@@ -387,15 +466,17 @@ class App:
                 if self.popup.timer is None:
                     self.popup.show(self.status.get(), 6000)
             elif kind == 'done':
-                final, paste, target, elapsed, warning = data
+                final, paste, target, elapsed, warning, workflow, question, context = data
                 self.status.set(f'完成，本地识别耗时 {elapsed:.1f} 秒。' + ('录音有丢帧，请核对文字。' if warning else '可复制结果。'))
                 self.popup.complete()
-                if paste:
+                if workflow == 'ask':
+                    self.answer_window.show(question, context, final)
+                elif paste:
                     operation = self.operation
                     self.root.after(120, lambda t=final, h=target, o=operation: self.paste(t, h, operation=o))
         if self.recording:
             seconds = time.monotonic() - self.started
-            self.status.set(f'正在录音… {seconds:.0f} / 90 秒')
+            self.status.set(f'{self.recording_status()} {seconds:.0f} / 90 秒')
             level = 0
             if self.frames:
                 level = min(1, float(np.sqrt(np.mean(self.frames[-1] ** 2))) * 12)
@@ -443,6 +524,7 @@ class App:
         self.hotkeys.stop()
         self.tray.stop()
         self.popup.close()
+        self.answer_window.close()
         self.root.destroy()
 
 
