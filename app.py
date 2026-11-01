@@ -14,8 +14,8 @@ import keyring
 import pyperclip
 from pynput import keyboard
 from core import ROOT, Transcriber, cleanup, translate_english, answer_question, download_model, model_ready
-from desktop import GlobalShortcut, StatusPopup, AnswerWindow, Tray
-from selection import capture_selection
+from desktop import GlobalShortcut, StatusPopup, AnswerWindow, Tray, enable_dpi_awareness
+from selection import capture_selection, SelectionSnapshot
 
 SERVICE = 'LocalVoiceInput.DeepSeek'
 USER = 'api-key'
@@ -43,6 +43,8 @@ class App:
         self.selected_text = ''
         self.last_workflow = 'dictate'
         self.last_context = ''
+        self.selection_anchor = None
+        self.last_anchor = None
         self.key = os.environ.get('DEEPSEEK_API_KEY', '')
         try:
             self.key = keyring.get_password(SERVICE, USER) or self.key
@@ -202,7 +204,7 @@ class App:
             self.events.put(('status', '模型准备完成，可以开始录音。'))
         self.background(run)
 
-    def toggle(self, via_hotkey=False, mode='dictate', context=None, target=None):
+    def toggle(self, via_hotkey=False, mode='dictate', context=None, target=None, anchor=None):
         if self.busy:
             self.popup.processing()
             return
@@ -224,6 +226,7 @@ class App:
             return
         self.workflow = mode
         self.selected_text = context or ''
+        self.selection_anchor = anchor
         self.popup.workflow = mode
         self.should_paste = bool(via_hotkey and self.auto.get() and mode != 'ask')
         self.frames = []
@@ -270,12 +273,17 @@ class App:
         self.popup.processing()
         def run():
             try:
-                text = capture_selection(target)
+                selected = capture_selection(target, with_location=True)
+                if isinstance(selected, SelectionSnapshot):
+                    text, anchor = selected.text, selected.anchor
+                else:
+                    text, anchor = selected, None
                 error = None
             except Exception as exc:
                 text = ''
+                anchor = None
                 error = str(exc) if isinstance(exc, RuntimeError) else '无法获取选中文本，请重新选择后重试。'
-            self.events.put(('selection_ready', (operation, target, text, error)))
+            self.events.put(('selection_ready', (operation, target, text, anchor, error)))
         threading.Thread(target=run, daemon=True).start()
 
     def cancel(self):
@@ -320,6 +328,7 @@ class App:
         self.result_caption.set({'dictate': '整理结果（自动分段 / 列点）',
                                  'translate': '英文译文', 'ask': '选中文本问答 · 答案'}[workflow])
         self.last_workflow, self.last_context = workflow, context
+        self.last_anchor = self.selection_anchor
         api_key = self.key_var.get().strip()
         model = self.model.get().strip()
         paste = self.should_paste and not self.audio_warning
@@ -345,12 +354,23 @@ class App:
             if workflow == 'translate':
                 final = translate_english(text, api_key, model)
             elif workflow == 'ask':
-                final = answer_question(text, context, api_key, model)
+                question, final = self.answer_filtered(text, context, api_key, model)
             else:
                 final = cleanup(text, api_key, model) if do_polish else text
             self.events.put(('result', final))
-            self.events.put(('done', (final, paste, target, elapsed, self.audio_warning, workflow, text, context)))
+            self.events.put(('done', (final, paste, target, elapsed, self.audio_warning, workflow,
+                                      question if workflow == 'ask' else text, context)))
         self.background(run)
+
+    def answer_filtered(self, text, context, api_key, model):
+        # Keep the raw transcript editable; only the cleaned question reaches Q&A
+        # and the result card. A cleanup failure must not silently bypass this step.
+        self.events.put(('status', '正在整理口述问题…'))
+        question = cleanup(text, api_key, model).strip()
+        if not question:
+            raise RuntimeError('问题整理后为空，请检查识别原文再重试。')
+        self.events.put(('status', '问题整理完成，正在根据选中文本回答…'))
+        return question, answer_question(question, context, api_key, model)
 
     def retry(self):
         if self.busy or self.recording:
@@ -368,11 +388,11 @@ class App:
             if workflow == 'translate':
                 final = translate_english(text, api_key, model)
             elif workflow == 'ask':
-                final = answer_question(text, context, api_key, model)
+                question, final = self.answer_filtered(text, context, api_key, model)
             else:
                 final = cleanup(text, api_key, model)
             self.events.put(('result', final))
-            self.events.put(('polished', (workflow, text, context, final)))
+            self.events.put(('polished', (workflow, question if workflow == 'ask' else text, context, final)))
         self.background(run)
 
     def copy(self, widget):
@@ -411,7 +431,7 @@ class App:
                     else:
                         self.toggle(via_hotkey=True, mode=mode, target=target)
             elif kind == 'selection_ready':
-                operation, target, text, error = data
+                operation, target, text, anchor, error = data
                 if operation != self.operation:
                     continue
                 self.busy = False
@@ -422,7 +442,7 @@ class App:
                     self.status.set(message)
                     self.popup.show(message, 7000)
                 else:
-                    self.toggle(via_hotkey=True, mode='ask', context=text, target=target)
+                    self.toggle(via_hotkey=True, mode='ask', context=text, target=target, anchor=anchor)
             elif kind == 'settings':
                 self.show_settings()
             elif kind == 'cancel':
@@ -450,7 +470,7 @@ class App:
                 self.status.set('处理完成，可复制结果。')
                 self.popup.complete()
                 if workflow == 'ask':
-                    self.answer_window.show(question, context, final)
+                    self.answer_window.show(question, final, anchor=self.last_anchor)
             elif kind == 'status' or kind == 'error':
                 self.status.set(data)
                 if kind == 'error' or not self.busy:
@@ -470,7 +490,7 @@ class App:
                 self.status.set(f'完成，本地识别耗时 {elapsed:.1f} 秒。' + ('录音有丢帧，请核对文字。' if warning else '可复制结果。'))
                 self.popup.complete()
                 if workflow == 'ask':
-                    self.answer_window.show(question, context, final)
+                    self.answer_window.show(question, final, anchor=self.last_anchor)
                 elif paste:
                     operation = self.operation
                     self.root.after(120, lambda t=final, h=target, o=operation: self.paste(t, h, operation=o))
@@ -529,6 +549,7 @@ class App:
 
 
 if __name__ == '__main__':
+    enable_dpi_awareness()
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE

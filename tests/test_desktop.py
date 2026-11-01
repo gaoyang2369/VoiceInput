@@ -7,7 +7,7 @@ import tkinter as tk
 import unittest
 from unittest.mock import patch
 
-from desktop import GlobalShortcut, StatusPopup, AnswerWindow, user32
+from desktop import GlobalShortcut, StatusPopup, AnswerWindow, answer_geometry, user32
 
 
 class ShortcutTests(unittest.TestCase):
@@ -114,8 +114,8 @@ class PopupTests(unittest.TestCase):
         answer = AnswerWindow(root)
         try:
             result = '第一点：测试全部通过。\n第二点：周五上线。'
-            answer.show('上线条件是什么？', '上下文\n' * 200, result)
-            answer.window.withdraw()
+            foreground = user32.GetForegroundWindow()
+            answer.show('上线条件是什么？', result, anchor=(200, 200, 300, 220))
             root.update_idletasks()
             def texts(widget):
                 for child in widget.winfo_children():
@@ -123,16 +123,47 @@ class PopupTests(unittest.TestCase):
                         yield child
                     yield from texts(child)
             output = list(texts(answer.window))
-            self.assertEqual(len(output), 1)
-            self.assertEqual(output[0].get('1.0', 'end-1c'), result)
-            self.assertEqual(output[0]['state'], 'disabled')
+            self.assertEqual(len(output), 2)
+            self.assertEqual(answer.question_text.get('1.0', 'end-1c'), '上线条件是什么？')
+            self.assertEqual(answer.answer_text.get('1.0', 'end-1c'), result)
+            self.assertEqual(answer.answer_text['state'], 'disabled')
+            self.assertLess(answer.window.winfo_height(), 350)
+            self.assertEqual(foreground, user32.GetForegroundWindow())
+            self.assertTrue(user32.IsWindowVisible(answer.hwnd))
+            short_height = answer.window.winfo_height()
             previous = answer.window
-            answer.show('新问题', '新材料', '新答案')
-            answer.window.withdraw()
+            answer.show('新问题', '很长的回答\n' * 200, anchor=(200, 200, 300, 220))
+            root.update_idletasks()
             self.assertFalse(previous.winfo_exists())
+            self.assertGreater(answer.window.winfo_height(), short_height)
+            self.assertEqual(answer.answer_text.get('1.0', 'end-1c'), '很长的回答\n' * 200)
         finally:
             answer.close()
             root.destroy()
+
+
+class AnswerPositionTests(unittest.TestCase):
+    def test_below_selection(self):
+        self.assertEqual(answer_geometry((100, 200, 300, 220), (420, 200), (0, 0, 1920, 1040)),
+                         (100, 232, 420, 200))
+
+    def test_above_near_taskbar(self):
+        self.assertEqual(answer_geometry((100, 980, 300, 1000), (420, 200), (0, 0, 1920, 1040)),
+                         (100, 768, 420, 200))
+
+    def test_negative_monitor_and_right_edge(self):
+        x, y, width, height = answer_geometry((-100, -200, -50, -180), (420, 250), (-1920, -1080, 0, 0))
+        self.assertGreaterEqual(x, -1920)
+        self.assertLessEqual(x + width, 0)
+        self.assertGreaterEqual(y, -1080)
+        self.assertLessEqual(y + height, 0)
+
+    def test_small_work_area_and_offscreen_anchor(self):
+        x, y, width, height = answer_geometry((4000, 4000, 4100, 4020), (420, 600), (0, 0, 320, 240))
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+        self.assertLessEqual(x + width, 320)
+        self.assertLessEqual(y + height, 240)
 
     def test_visible_noactivate_buttons_timer_and_render(self):
         root = tk.Tk()

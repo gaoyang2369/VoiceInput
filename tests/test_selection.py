@@ -3,7 +3,7 @@ import base64
 import subprocess
 from unittest.mock import patch
 
-from selection import capture_selection, UIA_SCRIPT
+from selection import capture_selection, UIA_SCRIPT, nearest_selection_rect, SelectionSnapshot
 
 
 class SelectionTests(unittest.TestCase):
@@ -19,6 +19,18 @@ class SelectionTests(unittest.TestCase):
              patch('selection.keyboard.Controller') as keyboard:
             self.assertEqual(capture_selection(123), '选中的材料')
             keyboard.assert_not_called()
+
+    def test_snapshot_keeps_bounds_near_original_cursor(self):
+        with patch('selection.read_uia_selection', return_value={
+                'supported': True, 'text': '选中的材料', 'bounds': [[100, 100, 300, 120], [100, 120, 220, 140]]}), \
+             patch('selection.cursor_anchor', return_value=(210, 135, 210, 135)):
+            selected = capture_selection(123, with_location=True)
+        self.assertEqual(selected, SelectionSnapshot('选中的材料', (100, 120, 220, 140)))
+
+    def test_invalid_or_unavailable_bounds_fall_back_to_trigger_point(self):
+        fallback = (20, 30, 20, 30)
+        self.assertEqual(nearest_selection_rect([[1, 1, 1, 1], [0, float('inf'), 20, 30]], fallback), fallback)
+        self.assertEqual(nearest_selection_rect([], fallback), fallback)
 
     def test_empty_supported_selection_never_uses_old_clipboard(self):
         with patch('selection.read_uia_selection', return_value={'supported': True, 'text': ''}), \

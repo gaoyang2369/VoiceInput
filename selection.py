@@ -4,6 +4,9 @@ import ctypes
 import json
 import subprocess
 import time
+import math
+from dataclasses import dataclass
+from ctypes import wintypes
 
 import pyperclip
 from pynput import keyboard
@@ -15,6 +18,36 @@ user32.GetClipboardOwner.restype = ctypes.c_void_p
 user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
 MAX_SELECTION = 20000
 
+
+@dataclass(frozen=True)
+class SelectionSnapshot:
+    text: str
+    anchor: tuple
+
+
+def cursor_anchor():
+    point = wintypes.POINT()
+    if user32.GetCursorPos(ctypes.byref(point)):
+        return (point.x, point.y, point.x, point.y)
+    return None
+
+
+def nearest_selection_rect(rectangles, fallback):
+    valid = []
+    for rect in rectangles or []:
+        if (isinstance(rect, (list, tuple)) and len(rect) == 4
+                and all(isinstance(v, (int, float)) and math.isfinite(v) and abs(v) < 10000000 for v in rect)
+                and rect[2] > rect[0] and rect[3] > rect[1]):
+            valid.append(tuple(round(v) for v in rect))
+    if not valid:
+        return fallback
+    if fallback is None:
+        return valid[-1]
+    px, py = fallback[:2]
+    def distance(rect):
+        return max(rect[0] - px, 0, px - rect[2]) ** 2 + max(rect[1] - py, 0, py - rect[3]) ** 2
+    return min(reversed(valid), key=distance)
+
 # Fixed script: no selected text or question is interpolated into executable code.
 UIA_SCRIPT = r'''
 $ErrorActionPreference = 'Stop'
@@ -25,18 +58,29 @@ try {
     $element = [System.Windows.Automation.AutomationElement]::FocusedElement
     $supported = $false
     $text = ''
+    $bounds = @()
     for ($i = 0; $i -lt 4 -and $null -ne $element; $i++) {
         if ($element.Current.IsPassword) { throw 'protected' }
         $pattern = $null
         if ($element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) {
             $supported = $true
-            $parts = @($pattern.GetSelection() | ForEach-Object { $_.GetText(20001) })
+            $ranges = $pattern.GetSelection()
+            $parts = @($ranges | ForEach-Object { $_.GetText(20001) })
             $text = $parts -join "`n"
+            foreach ($range in $ranges) {
+                try {
+                    foreach ($rect in $range.GetBoundingRectangles()) {
+                        if (!$rect.IsEmpty -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
+                            $bounds += ,@([double]$rect.Left, [double]$rect.Top, [double]$rect.Right, [double]$rect.Bottom)
+                        }
+                    }
+                } catch { } # Bounds are optional; keep successfully read text.
+            }
             break
         }
         $element = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($element)
     }
-    @{supported=$supported; text=$text; protected=$false} | ConvertTo-Json -Compress
+    @{supported=$supported; text=$text; bounds=$bounds; protected=$false} | ConvertTo-Json -Compress -Depth 4
 } catch {
     @{supported=$false; text=''; protected=($_.Exception.Message -eq 'protected')} | ConvertTo-Json -Compress
 }
@@ -63,13 +107,17 @@ def validate_selection(text):
     return text.strip()
 
 
-def capture_selection(target):
+def capture_selection(target, with_location=False):
     """Never activate another window or mistake old clipboard text for a selection."""
     def check_target():
         if user32.GetForegroundWindow() != target:
             raise RuntimeError('获取选中文本时窗口已切换，请在原窗口重新选择并触发。')
 
     check_target()
+    fallback = cursor_anchor()
+    def result(text, bounds=None):
+        text = validate_selection(text)
+        return SelectionSnapshot(text, nearest_selection_rect(bounds, fallback)) if with_location else text
     deadline = time.monotonic() + 3
     while any(user32.GetAsyncKeyState(k) & 0x8000 for k in (0x10, 0x11, 0x12, 0x5B, 0x5C)):
         check_target()
@@ -81,7 +129,7 @@ def capture_selection(target):
     if selected.get('protected'):
         raise RuntimeError('无法读取受保护输入框，请在普通文本区域选择内容。')
     if selected.get('supported'):
-        return validate_selection(selected.get('text', ''))
+        return result(selected.get('text', ''), selected.get('bounds'))
 
     # Do not empty or insert a sentinel into the clipboard. A sequence change is
     # required, even when its existing text happens to match the current selection.
@@ -103,7 +151,7 @@ def capture_selection(target):
                 if source_pid.value != owner_pid.value:
                     raise RuntimeError('剪贴板被其他程序更新，请重新选择文本后重试。')
             try:
-                return validate_selection(pyperclip.paste())
+                return result(pyperclip.paste())
             except pyperclip.PyperclipException:
                 pass
         time.sleep(0.03)

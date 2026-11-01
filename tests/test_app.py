@@ -2,10 +2,11 @@
 import time
 import tkinter as tk
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 import numpy as np
 from app import App
+from selection import SelectionSnapshot
 
 
 class RecordingTests(unittest.TestCase):
@@ -138,8 +139,9 @@ class RecordingTests(unittest.TestCase):
     def test_question_captures_selection_and_opens_answer_without_pasting(self):
         self.app.key_var.set('test-key')
         context = '计划于周五上线，前提是测试全部通过。'
+        anchor = (200, 200, 300, 220)
         with patch('app.user32.GetForegroundWindow', return_value=123), \
-             patch('app.capture_selection', return_value=context), \
+             patch('app.capture_selection', return_value=SelectionSnapshot(context, anchor)), \
              patch('app.sd.query_devices', return_value={'default_samplerate': 16000}), \
              patch('app.sd.InputStream'):
             self.app.toggle(via_hotkey=True, mode='ask')
@@ -149,18 +151,46 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(self.app.should_paste)
         self.app.frames = [np.ones((8000, 1), dtype=np.float32) * 0.1]
         self.app.engine = MagicMock()
-        self.app.engine.transcribe.return_value = '上线的前提是什么'
-        with patch('app.answer_question', return_value='前提是测试全部通过。') as answer, \
+        original = '嗯那个我想问一下上线的前提是什么'
+        cleaned = '上线需要满足什么前提？'
+        self.app.engine.transcribe.return_value = original
+        self.app.polish.set(False)
+        with patch('app.cleanup', return_value=cleaned) as cleanup, \
+             patch('app.answer_question', return_value='前提是测试全部通过。') as answer, \
              patch.object(self.app, 'paste') as paste:
+            steps = MagicMock()
+            steps.attach_mock(cleanup, 'cleanup')
+            steps.attach_mock(answer, 'answer')
             self.app.stop()
             self.wait_idle()
-            answer.assert_called_once_with('上线的前提是什么', context, 'test-key', self.app.model.get())
+            self.assertEqual(steps.mock_calls, [
+                call.cleanup(original, 'test-key', self.app.model.get()),
+                call.answer(cleaned, context, 'test-key', self.app.model.get())])
             paste.assert_not_called()
-        self.app.answer_window.show.assert_called_once_with('上线的前提是什么', context, '前提是测试全部通过。')
-        with patch('app.answer_question', return_value='再次回答。') as answer:
+        self.assertEqual(self.app.raw.get('1.0', 'end-1c'), original)
+        self.app.answer_window.show.assert_called_once_with(cleaned, '前提是测试全部通过。', anchor=anchor)
+        revised = '上线前的必要条件是什么？'
+        with patch('app.cleanup', return_value=revised) as cleanup, \
+             patch('app.answer_question', return_value='再次回答。') as answer:
             self.app.retry()
             self.wait_idle()
-            self.assertEqual(answer.call_args.args[1], context)
+            cleanup.assert_called_once_with(original, 'test-key', self.app.model.get())
+            answer.assert_called_once_with(revised, context, 'test-key', self.app.model.get())
+            self.assertEqual(self.app.answer_window.show.call_args.args[0], revised)
+            self.assertEqual(self.app.answer_window.show.call_args.kwargs['anchor'], anchor)
+
+    def test_question_cleanup_failure_never_falls_back_to_raw_question(self):
+        with patch('app.cleanup', side_effect=RuntimeError('整理失败，原文已保留。')), \
+             patch('app.answer_question') as answer:
+            with self.assertRaisesRegex(RuntimeError, '整理失败'):
+                self.app.answer_filtered('嗯原始问题', '材料', 'test-key', 'test-model')
+            answer.assert_not_called()
+
+    def test_empty_cleaned_question_is_not_submitted(self):
+        with patch('app.cleanup', return_value='  \n'), patch('app.answer_question') as answer:
+            with self.assertRaisesRegex(RuntimeError, '问题整理后为空'):
+                self.app.answer_filtered('嗯那个', '材料', 'test-key', 'test-model')
+            answer.assert_not_called()
 
     def test_no_selection_does_not_start_microphone(self):
         self.app.key_var.set('test-key')

@@ -5,6 +5,7 @@ import threading
 import math
 import tkinter as tk
 from tkinter import ttk
+from tkinter import font as tkfont
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 LRESULT = ctypes.c_ssize_t
@@ -336,46 +337,187 @@ class GlobalShortcut:
             self.thread.join(timeout=1)
 
 
+def enable_dpi_awareness():
+    # UI Automation returns physical screen coordinates, so use the same space.
+    try:
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except AttributeError:
+        user32.SetProcessDPIAware()
+
+
+def answer_geometry(anchor, size, work, gap=12):
+    """Prefer below/above the selected line; keep the whole card in the work area."""
+    left, top, right, bottom = work
+    margin = min(12, max(0, (right - left) // 10), max(0, (bottom - top) // 10))
+    width = min(size[0], right - left - margin * 2)
+    height = min(size[1], bottom - top - margin * 2)
+    ax, ay, ar, ab = anchor
+    x = ax
+    if ab + gap + height <= bottom - margin:
+        y = ab + gap
+    elif ay - gap - height >= top + margin:
+        y = ay - gap - height
+    elif right - ar >= width + gap + margin:
+        x, y = ar + gap, ay
+    elif ax - left >= width + gap + margin:
+        x, y = ax - width - gap, ay
+    else:
+        y = ab + gap if bottom - ab >= ay - top else ay - gap - height
+    return (round(max(left + margin, min(x, right - margin - width))),
+            round(max(top + margin, min(y, bottom - margin - height))), round(width), round(height))
+
+
+def anchor_work_area(anchor):
+    rect = w.RECT(*anchor)
+    user32.MonitorFromRect.argtypes = [ctypes.POINTER(w.RECT), w.DWORD]
+    user32.MonitorFromRect.restype = w.HANDLE
+    monitor = user32.MonitorFromRect(ctypes.byref(rect), 2)
+    info = MonitorInfo()
+    info.cbSize = ctypes.sizeof(info)
+    if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        r = info.rcWork
+        return (r.left, r.top, r.right, r.bottom)
+    return (0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+
+
+def wrapped_lines(text, font, width, limit):
+    """Bounded measurement for short cards; long text stays in scrollable widgets."""
+    lines, used, widths = 1, 0, {}
+    for char in text:
+        if char == '\n':
+            lines, used = lines + 1, 0
+        else:
+            if char not in widths:
+                widths[char] = font.measure(char)
+            advance = widths[char]
+            if used and used + advance > width:
+                lines, used = lines + 1, 0
+            used += advance
+        if lines > limit:
+            return limit + 1
+    return lines
+
+
 class AnswerWindow:
     """Answers appear separately so the original selected text stays intact."""
     def __init__(self, root):
         self.root = root
         self.window = None
 
-    def show(self, question, context, answer):
+    def show(self, question, answer, anchor=None):
         import pyperclip
+        from selection import cursor_anchor
         if self.window is not None and self.window.winfo_exists():
             self.window.destroy()
         self.window = tk.Toplevel(self.root)
-        self.window.title('轻声输入 · 选中文本问答')
-        self.window.geometry('580x500')
-        self.window.minsize(400, 320)
-        panel = ttk.Frame(self.window, padding=18)
+        self.window.withdraw()
+        self.window.title('轻声输入 · 回答')
+        self.window.overrideredirect(True)
+        self.window.configure(bg='#dbe5df')
+        self.window.bind('<Escape>', lambda event: self.close())
+        anchor = anchor or cursor_anchor() or (80, 80, 80, 80)
+        work = anchor_work_area(anchor)
+        scale = max(1, self.window.winfo_fpixels('1i') / 96)
+        pad = round(20 * scale)
+        width = min(round(720 * scale), work[2] - work[0] - 24)
+        body_width = width - pad * 2 - round(16 * scale)
+        question_font = tkfont.Font(self.window, family='Microsoft YaHei UI', size=12)
+        answer_font = tkfont.Font(self.window, family='Microsoft YaHei UI', size=13)
+        self.question_font, self.answer_font = question_font, answer_font
+        qlines = wrapped_lines(question, question_font, body_width, 5)
+        alines = wrapped_lines(answer, answer_font, body_width, 14)
+        # Real word wrapping may use slightly more lines than character measures.
+        if len(answer) > 60 and alines <= 14:
+            alines += 1
+        max_height = min(round(660 * scale), round((work[3] - work[1]) * 0.7))
+        chrome = round(136 * scale)
+        qheight = min(qlines, 5) * (question_font.metrics('linespace') + 6)
+        aheight = min(alines, 14) * (answer_font.metrics('linespace') + 6)
+        height = min(max_height, max(round(200 * scale), chrome + qheight + aheight))
+        x, y, width, height = answer_geometry(anchor, (width, height), work)
+        self.window.geometry(f'{width}x{height}')
+        panel = tk.Frame(self.window, bg='white', padx=pad, pady=round(12 * scale))
         panel.pack(fill='both', expand=True)
-        ttk.Label(panel, text='选中文本问答', font=('Microsoft YaHei UI', 16, 'bold')).pack(anchor='w')
-        preview = context.replace('\n', ' ')[:180] + ('…' if len(context) > 180 else '')
-        context_label = ttk.Label(panel, text='所选内容：' + preview, wraplength=510, foreground='#666666')
-        context_label.pack(anchor='w', pady=(8, 6))
-        question_label = ttk.Label(panel, text='问题：' + question.replace('\n', ' ')[:200], wraplength=510)
-        question_label.pack(anchor='w', pady=(0, 10))
-        def resize(event):
-            context_label.configure(wraplength=max(240, event.width - 36))
-            question_label.configure(wraplength=max(240, event.width - 36))
-        panel.bind('<Configure>', resize)
-        body = ttk.Frame(panel)
+        panel.pack_configure(padx=1, pady=1)
+        heading = tk.Frame(panel, bg='white')
+        heading.pack(fill='x')
+        tk.Label(heading, text='问题', bg='white', fg='#829088', font=('Microsoft YaHei UI', 10)).pack(side='left')
+        tk.Button(heading, text='×', command=self.close, font=('Segoe UI', 17),
+                  fg='#829088', bg='white', activebackground='#f1f5f3',
+                  bd=0, highlightthickness=0, cursor='hand2', padx=4, pady=0).pack(side='right')
+        question_body = tk.Frame(panel, bg='white', height=qheight)
+        question_body.pack(fill='x', pady=(2, round(12 * scale)))
+        question_body.pack_propagate(False)
+        self.question_text = tk.Text(question_body, wrap='word', font=question_font, bg='white', fg='#52645a',
+                                    bd=0, highlightthickness=0, padx=0, pady=0, spacing1=3, spacing3=3,
+                                    selectbackground='#daeee4', selectforeground='#233d30')
+        self.question_text.insert('1.0', question)
+        self.question_text.configure(state='disabled')
+        self.question_text.pack(side='left', fill='both', expand=True)
+        if qlines > 5:
+            scroll = ttk.Scrollbar(question_body, command=self.question_text.yview)
+            self.question_text.configure(yscrollcommand=scroll.set)
+            scroll.pack(side='right', fill='y')
+        tk.Frame(panel, bg='#e9eeeb', height=1).pack(fill='x', pady=(0, round(10 * scale)))
+        answer_heading = tk.Frame(panel, bg='white')
+        answer_heading.pack(fill='x', pady=(0, round(6 * scale)))
+        tk.Label(answer_heading, text='回答', bg='white', fg='#829088', font=('Microsoft YaHei UI', 10)).pack(side='left')
+        def copy_answer():
+            pyperclip.copy(answer)
+            copy_button.configure(text='已复制')
+        copy_button = tk.Button(answer_heading, text='复制', command=copy_answer, font=('Microsoft YaHei UI', 10),
+                                fg='#27775a', bg='white', activebackground='#eff7f2',
+                                bd=0, highlightthickness=0, cursor='hand2', padx=4, pady=0)
+        copy_button.pack(side='right')
+        body = tk.Frame(panel, bg='white')
         body.pack(fill='both', expand=True)
-        output = tk.Text(body, wrap='word', font=('Microsoft YaHei UI', 11), padx=10, pady=10)
+        output = tk.Text(body, wrap='word', font=answer_font, bg='white', fg='#24392e',
+                         bd=0, highlightthickness=0, padx=0, pady=0, spacing1=3, spacing3=3,
+                         selectbackground='#daeee4', selectforeground='#233d30')
+        self.answer_text = output
         scroll = ttk.Scrollbar(body, command=output.yview)
-        output.configure(yscrollcommand=scroll.set)
-        scroll.pack(side='right', fill='y')
+        def scrolling(first, last):
+            scroll.set(first, last)
+            if float(first) > 0 or float(last) < 1:
+                if not scroll.winfo_manager():
+                    scroll.pack(side='right', fill='y', before=output)
+            elif scroll.winfo_manager():
+                scroll.pack_forget()
+        output.configure(yscrollcommand=scrolling)
         output.pack(side='left', fill='both', expand=True)
         output.insert('1.0', answer)
         output.configure(state='disabled')
-        buttons = ttk.Frame(panel)
-        buttons.pack(fill='x', pady=(12, 0))
-        ttk.Button(buttons, text='复制答案', command=lambda: pyperclip.copy(answer)).pack(side='left')
-        ttk.Button(buttons, text='关闭', command=self.window.destroy).pack(side='right')
-        self.window.lift()
+        self.window.update_idletasks()
+        self.hwnd = user32.GetParent(self.window.winfo_id()) or self.window.winfo_id()
+        style = user32.GetWindowLongPtrW(self.hwnd, -20)
+        # Tk must map its child windows too. Merely showing the native wrapper
+        # leaves a blank card on the interactive desktop.
+        self.window.wm_attributes('-alpha', 0)
+        user32.SetWindowLongPtrW(self.hwnd, -20, style | 0x08000080)
+        self.window.deiconify()
+        self.window.update_idletasks()
+        gdi = ctypes.windll.gdi32
+        gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+        gdi.CreateRoundRectRgn.restype = w.HANDLE
+        user32.SetWindowRgn.argtypes = [w.HWND, w.HANDLE, w.BOOL]
+        region = gdi.CreateRoundRectRgn(0, 0, width + 1, height + 1, round(18 * scale), round(18 * scale))
+        if region and not user32.SetWindowRgn(self.hwnd, region, True):
+            gdi.DeleteObject.argtypes = [w.HANDLE]
+            gdi.DeleteObject(region)
+        # Show the result without taking keyboard focus from the source document.
+        user32.SetWindowPos(self.hwnd, None, x, y, width, height, 0x0050)
+        self.window.wm_attributes('-alpha', 1)
+        user32.SetWindowLongPtrW(self.hwnd, -20,
+                                user32.GetWindowLongPtrW(self.hwnd, -20) & ~0x08000000 | 0x80)
+        def drag_start(event):
+            self.drag_offset = (event.x_root - self.window.winfo_rootx(), event.y_root - self.window.winfo_rooty())
+        def drag(event):
+            dx, dy = self.drag_offset
+            user32.SetWindowPos(self.hwnd, None, event.x_root - dx, event.y_root - dy, 0, 0, 0x0011)
+        for widget in (heading, heading.winfo_children()[0]):
+            widget.bind('<Button-1>', drag_start)
+            widget.bind('<B1-Motion>', drag)
 
     def close(self):
         if self.window is not None and self.window.winfo_exists():
