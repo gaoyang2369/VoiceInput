@@ -1,0 +1,9 @@
+sherpa-onnx==2.0.1
+numpy==2.5.4
+sounddevice==0.5.6
+pynput==1.8.2
+pyperclip==1.11.0
+keyring==25.7.0
+requests==2.34.2
+pystray==0.19.5
+pillow==13.0.0
