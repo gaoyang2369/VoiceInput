@@ -1,3 +1,4 @@
+"""Tk application state, recording workflow and foreground-safe result delivery."""
 import ctypes
 from ctypes import wintypes
 import json
@@ -13,15 +14,32 @@ import sounddevice as sd
 import keyring
 import pyperclip
 from pynput import keyboard
-from core import ROOT, Transcriber, cleanup, translate_english, answer_question, download_model, model_ready
+from core import ROOT, DEFAULT_MODEL, Transcriber, cleanup, translate_english, answer_question, download_model, model_ready
 from desktop import GlobalShortcut, StatusPopup, AnswerWindow, Tray, enable_dpi_awareness
-from selection import capture_selection, SelectionSnapshot
+from selection import capture_selection
 
 SERVICE = 'LocalVoiceInput.DeepSeek'
 USER = 'api-key'
 CONFIG = ROOT / 'settings.json'
 user32 = ctypes.windll.user32
 user32.GetForegroundWindow.restype = wintypes.HWND
+
+
+def load_settings(path=CONFIG):
+    try:
+        settings = json.loads(path.read_text('utf-8'))
+    except (OSError, ValueError):
+        settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    model = settings.get('model')
+    microphone = settings.get('microphone')
+    return {
+        'model': model.strip() if isinstance(model, str) and model.strip() else DEFAULT_MODEL,
+        'microphone': microphone if isinstance(microphone, str) else '',
+        'polish': settings.get('polish') if isinstance(settings.get('polish'), bool) else True,
+        'auto_paste': settings.get('auto_paste') if isinstance(settings.get('auto_paste'), bool) else True,
+    }
 
 
 class App:
@@ -50,11 +68,7 @@ class App:
             self.key = keyring.get_password(SERVICE, USER) or self.key
         except Exception:
             pass
-        settings = {}
-        try:
-            settings = json.loads(CONFIG.read_text('utf-8'))
-        except (OSError, ValueError):
-            pass
+        settings = load_settings()
         root.title('轻声输入 · 本地识别 + DeepSeek')
         root.geometry('820x790')
         root.minsize(680, 620)
@@ -76,7 +90,7 @@ class App:
         row = ttk.Frame(panel)
         row.pack(fill='x', pady=10)
         ttk.Label(row, text='整理模型').pack(side='left')
-        self.model = tk.StringVar(value=settings.get('model', 'deepseek-flash'))
+        self.model = tk.StringVar(value=settings['model'])
         ttk.Entry(row, textvariable=self.model, width=23).pack(side='left', padx=10)
         self.polish = tk.BooleanVar(value=settings.get('polish', True))
         self.auto = tk.BooleanVar(value=settings.get('auto_paste', True))
@@ -180,9 +194,7 @@ class App:
             messagebox.showerror('删除失败', '无法访问 Windows 凭据管理器。')
 
     def background(self, fn):
-        self.busy = True
-        self.record_button.configure(state='disabled')
-        self.download_button.configure(state='disabled')
+        self.set_busy(True)
         def run():
             try:
                 fn()
@@ -191,6 +203,42 @@ class App:
                 self.events.put(('error', str(exc) if isinstance(exc, RuntimeError) else '操作失败，请检查网络、模型文件或麦克风设置。'))
             finally:
                 self.events.put(('idle', None))
+        threading.Thread(target=run, daemon=True).start()
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.record_button.configure(state='disabled' if busy else 'normal')
+        self.download_button.configure(state='disabled' if busy or self.recording else 'normal')
+
+    def release_stream(self):
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+
+    def process_text(self, text, workflow, context, api_key, model, polish=True):
+        """Shared routing for a new recording and an edited-transcript retry."""
+        if workflow == 'translate':
+            return text, translate_english(text, api_key, model)
+        if workflow == 'ask':
+            return self.answer_filtered(text, context, api_key, model)
+        return text, cleanup(text, api_key, model) if polish else text
+
+    def prepare_question(self, target, operation):
+        self.set_busy(True)
+        self.status.set('正在获取选中文本，请松开快捷键…')
+        self.popup.processing()
+        def run():
+            try:
+                selected = capture_selection(target, with_location=True)
+                text, anchor = selected.text, selected.anchor
+                error = None
+            except Exception as exc:
+                text, anchor = '', None
+                error = str(exc) if isinstance(exc, RuntimeError) else '无法获取选中文本，请重新选择后重试。'
+            self.events.put(('selection_ready', (operation, target, text, anchor, error)))
         threading.Thread(target=run, daemon=True).start()
 
     def download(self):
@@ -265,35 +313,12 @@ class App:
         return {'dictate': '正在听写…', 'translate': '正在录音 · 英文翻译…',
                 'ask': '已获取选中文本 · 请说出问题…'}[self.workflow]
 
-    def prepare_question(self, target, operation):
-        self.busy = True
-        self.record_button.configure(state='disabled')
-        self.download_button.configure(state='disabled')
-        self.status.set('正在获取选中文本，请松开快捷键…')
-        self.popup.processing()
-        def run():
-            try:
-                selected = capture_selection(target, with_location=True)
-                if isinstance(selected, SelectionSnapshot):
-                    text, anchor = selected.text, selected.anchor
-                else:
-                    text, anchor = selected, None
-                error = None
-            except Exception as exc:
-                text = ''
-                anchor = None
-                error = str(exc) if isinstance(exc, RuntimeError) else '无法获取选中文本，请重新选择后重试。'
-            self.events.put(('selection_ready', (operation, target, text, anchor, error)))
-        threading.Thread(target=run, daemon=True).start()
-
     def cancel(self):
         if not self.recording:
             return
         self.recording = False
         self.operation += 1
-        self.stream.stop()
-        self.stream.close()
-        self.stream = None
+        self.release_stream()
         self.frames = []
         self.selected_text = ''
         self.level['value'] = 0
@@ -304,9 +329,7 @@ class App:
 
     def stop(self):
         self.recording = False
-        self.stream.stop()
-        self.stream.close()
-        self.stream = None
+        self.release_stream()
         self.record_button.configure(text='开始录音   右 Alt')
         self.level['value'] = 0
         if not self.frames:
@@ -351,15 +374,10 @@ class App:
                 self.events.put(('processing', '正在整理文字…'))
             stage = {'dictate': '整理', 'translate': '翻译成英文', 'ask': '回答问题'}[workflow]
             self.events.put(('status', f'本地识别 {elapsed:.1f} 秒；' + (f'DeepSeek {stage}中…' if needs_model else '完成。')))
-            if workflow == 'translate':
-                final = translate_english(text, api_key, model)
-            elif workflow == 'ask':
-                question, final = self.answer_filtered(text, context, api_key, model)
-            else:
-                final = cleanup(text, api_key, model) if do_polish else text
+            question, final = self.process_text(text, workflow, context, api_key, model, do_polish)
             self.events.put(('result', final))
             self.events.put(('done', (final, paste, target, elapsed, self.audio_warning, workflow,
-                                      question if workflow == 'ask' else text, context)))
+                                      question)))
         self.background(run)
 
     def answer_filtered(self, text, context, api_key, model):
@@ -385,14 +403,9 @@ class App:
         self.status.set('DeepSeek 正在重试上次任务…')
         self.popup.processing()
         def run():
-            if workflow == 'translate':
-                final = translate_english(text, api_key, model)
-            elif workflow == 'ask':
-                question, final = self.answer_filtered(text, context, api_key, model)
-            else:
-                final = cleanup(text, api_key, model)
+            question, final = self.process_text(text, workflow, context, api_key, model)
             self.events.put(('result', final))
-            self.events.put(('polished', (workflow, question if workflow == 'ask' else text, context, final)))
+            self.events.put(('polished', (workflow, question, final)))
         self.background(run)
 
     def copy(self, widget):
@@ -434,9 +447,7 @@ class App:
                 operation, target, text, anchor, error = data
                 if operation != self.operation:
                     continue
-                self.busy = False
-                self.record_button.configure(state='normal')
-                self.download_button.configure(state='normal')
+                self.set_busy(False)
                 if error or user32.GetForegroundWindow() != target:
                     message = error or '输入窗口已切换，请重新选择文本后重试。'
                     self.status.set(message)
@@ -466,7 +477,7 @@ class App:
             elif kind == 'processing':
                 self.popup.processing()
             elif kind == 'polished':
-                workflow, question, context, final = data
+                workflow, question, final = data
                 self.status.set('处理完成，可复制结果。')
                 self.popup.complete()
                 if workflow == 'ask':
@@ -480,13 +491,11 @@ class App:
             elif kind == 'result':
                 self.replace(self.result, data)
             elif kind == 'idle':
-                self.busy = False
-                self.record_button.configure(state='normal')
-                self.download_button.configure(state='normal')
+                self.set_busy(False)
                 if self.popup.timer is None:
                     self.popup.show(self.status.get(), 6000)
             elif kind == 'done':
-                final, paste, target, elapsed, warning, workflow, question, context = data
+                final, paste, target, elapsed, warning, workflow, question = data
                 self.status.set(f'完成，本地识别耗时 {elapsed:.1f} 秒。' + ('录音有丢帧，请核对文字。' if warning else '可复制结果。'))
                 self.popup.complete()
                 if workflow == 'ask':
@@ -534,18 +543,20 @@ class App:
             self.popup.show('自动输入失败，请从托盘复制结果。', 6000)
 
     def close(self):
+        if self.closed:
+            return
         self.closed = True
         if self.drain_timer is not None:
             self.root.after_cancel(self.drain_timer)
             self.drain_timer = None
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-        self.hotkeys.stop()
-        self.tray.stop()
-        self.popup.close()
-        self.answer_window.close()
-        self.root.destroy()
+        # Best-effort shutdown: one unavailable device must not leave hooks or
+        # tray windows running. Process exit releases native singleton handles.
+        for cleanup_action in (self.release_stream, self.hotkeys.stop, self.tray.stop,
+                               self.popup.close, self.answer_window.close, self.root.destroy):
+            try:
+                cleanup_action()
+            except Exception:
+                continue
 
 
 if __name__ == '__main__':

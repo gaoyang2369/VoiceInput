@@ -142,29 +142,7 @@ class PopupTests(unittest.TestCase):
             root.destroy()
 
 
-class AnswerPositionTests(unittest.TestCase):
-    def test_below_selection(self):
-        self.assertEqual(answer_geometry((100, 200, 300, 220), (420, 200), (0, 0, 1920, 1040)),
-                         (100, 232, 420, 200))
-
-    def test_above_near_taskbar(self):
-        self.assertEqual(answer_geometry((100, 980, 300, 1000), (420, 200), (0, 0, 1920, 1040)),
-                         (100, 768, 420, 200))
-
-    def test_negative_monitor_and_right_edge(self):
-        x, y, width, height = answer_geometry((-100, -200, -50, -180), (420, 250), (-1920, -1080, 0, 0))
-        self.assertGreaterEqual(x, -1920)
-        self.assertLessEqual(x + width, 0)
-        self.assertGreaterEqual(y, -1080)
-        self.assertLessEqual(y + height, 0)
-
-    def test_small_work_area_and_offscreen_anchor(self):
-        x, y, width, height = answer_geometry((4000, 4000, 4100, 4020), (420, 600), (0, 0, 320, 240))
-        self.assertGreaterEqual(x, 0)
-        self.assertGreaterEqual(y, 0)
-        self.assertLessEqual(x + width, 320)
-        self.assertLessEqual(y + height, 240)
-
+class StatusPopupTests(unittest.TestCase):
     def test_visible_noactivate_buttons_timer_and_render(self):
         root = tk.Tk()
         root.withdraw()
@@ -188,7 +166,7 @@ class AnswerPositionTests(unittest.TestCase):
                 root.update()
                 self.assertEqual(events.get_nowait(), (expected, None))
                 self.assertEqual(foreground, user32.GetForegroundWindow())
-            popup.render(level=0.8).save('tests/recording-preview.png')
+            self.assertEqual(popup.render(level=0.8).size, (150, 48))
             popup.show('正在识别语音…')
             self.assertTrue(events.empty())
             popup.hide()
@@ -238,6 +216,30 @@ class AnswerPositionTests(unittest.TestCase):
         finally:
             popup.close()
             root.destroy()
+
+
+class AnswerPositionTests(unittest.TestCase):
+    def test_below_selection(self):
+        self.assertEqual(answer_geometry((100, 200, 300, 220), (720, 200), (0, 0, 1920, 1040)),
+                         (100, 232, 720, 200))
+
+    def test_above_near_taskbar(self):
+        self.assertEqual(answer_geometry((100, 980, 300, 1000), (720, 200), (0, 0, 1920, 1040)),
+                         (100, 768, 720, 200))
+
+    def test_negative_monitor_and_right_edge(self):
+        x, y, width, height = answer_geometry((-100, -200, -50, -180), (720, 250), (-1920, -1080, 0, 0))
+        self.assertGreaterEqual(x, -1920)
+        self.assertLessEqual(x + width, 0)
+        self.assertGreaterEqual(y, -1080)
+        self.assertLessEqual(y + height, 0)
+
+    def test_small_work_area_and_offscreen_anchor(self):
+        x, y, width, height = answer_geometry((4000, 4000, 4100, 4020), (720, 600), (0, 0, 320, 240))
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+        self.assertLessEqual(x + width, 320)
+        self.assertLessEqual(y + height, 240)
 
 
 if __name__ == '__main__':

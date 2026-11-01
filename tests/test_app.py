@@ -12,6 +12,7 @@ from selection import SelectionSnapshot
 class RecordingTests(unittest.TestCase):
     def setUp(self):
         self.patches = [
+            patch('app.load_settings', return_value={'model': 'test-model'}),
             patch('app.Tray'), patch('app.GlobalShortcut'),
             patch('app.keyring.get_password', return_value=''),
             patch('app.model_ready', return_value=True),
@@ -47,6 +48,24 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(self.app.recording)
         self.assertEqual(self.app.frames, [])
         self.assertFalse(self.app.busy)
+
+    def test_stream_is_closed_even_when_stopping_fails(self):
+        stream = MagicMock()
+        stream.stop.side_effect = RuntimeError('device unavailable')
+        self.app.stream = stream
+        with self.assertRaises(RuntimeError):
+            self.app.release_stream()
+        stream.close.assert_called_once()
+        self.assertIsNone(self.app.stream)
+
+    def test_shutdown_still_stops_hooks_and_tray_if_device_fails(self):
+        self.app.stream = MagicMock()
+        self.app.stream.stop.side_effect = RuntimeError('device unavailable')
+        self.app.close()
+        self.app.hotkeys.stop.assert_called_once()
+        self.app.tray.stop.assert_called_once()
+        self.app.answer_window.close.assert_called_once()
+        self.assertTrue(self.app.closed)
 
     def test_finish_processes_audio_and_updates_result(self):
         self.start_recording()

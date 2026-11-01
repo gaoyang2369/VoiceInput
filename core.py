@@ -1,11 +1,13 @@
 """Local CPU transcription and optional DeepSeek cleanup. No audio uploads."""
 import json
 import os
+import shutil
 import tarfile
 from pathlib import Path
 import requests
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_MODEL = 'deepseek-flash'
 MODEL_DIR = ROOT / 'models'
 MODEL_URL = ('https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/'
              'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2')
@@ -78,7 +80,6 @@ def download_model(progress=lambda _: None):
                     source = tar.extractfile(member)
                     target = MODEL_DIR / (name + '.part')
                     with source, target.open('wb') as out:
-                        import shutil
                         shutil.copyfileobj(source, out)
                     target.replace(MODEL_DIR / name)
         if not model_ready():
@@ -105,7 +106,7 @@ class Transcriber:
         return stream.result.text.strip()
 
 
-def cleanup(text, api_key, model='deepseek-flash', session=None):
+def cleanup(text, api_key, model=DEFAULT_MODEL, session=None):
     if not text.strip():
         return ''
     return _request([{'role': 'system', 'content': PROMPT},
@@ -129,14 +130,14 @@ ANSWER_PROMPT = '''你是选中文本问答助手。用户消息是 JSON，quest
 按语义自然分段，明确的多个要点每项一行。使用便于复制的纯文本，不使用代码围栏或装饰性 Markdown。'''
 
 
-def translate_english(text, api_key, model='deepseek-flash', session=None):
+def translate_english(text, api_key, model=DEFAULT_MODEL, session=None):
     if not text.strip():
         return ''
     return _request([{'role': 'system', 'content': TRANSLATE_PROMPT},
                      {'role': 'user', 'content': text}], api_key, model, session)
 
 
-def answer_question(question, selected_text, api_key, model='deepseek-flash', session=None):
+def answer_question(question, selected_text, api_key, model=DEFAULT_MODEL, session=None):
     if not question.strip():
         raise RuntimeError('没有识别到问题，请重新录音。')
     if not selected_text.strip():
@@ -171,7 +172,7 @@ def _request(messages, api_key, model, session=None):
         data = response.json()
         choice = data['choices'][0]
         if choice.get('finish_reason') == 'length':
-            raise RuntimeError('整理结果超出长度限制，原文已保留。')
+            raise RuntimeError('处理结果超出长度限制，原文已保留。')
         result = choice['message']['content']
         if not isinstance(result, str) or not result.strip():
             raise ValueError()

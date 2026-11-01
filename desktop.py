@@ -1,4 +1,4 @@
-"""Windows background integration; popup windows never activate the target app."""
+"""Windows shortcut/tray integration, recording indicator and answer card."""
 import ctypes
 from ctypes import wintypes as w
 import threading
@@ -22,15 +22,9 @@ user32.CallWindowProcW.restype = LRESULT
 
 kernel32 = ctypes.windll.kernel32
 user32.GetForegroundWindow.restype = w.HWND
-user32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    w.HWND, w.HMENU, w.HINSTANCE, w.LPVOID]
-user32.CreateWindowExW.restype = w.HWND
-user32.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
 user32.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
                               ctypes.c_int, ctypes.c_int, w.UINT]
 user32.ShowWindow.argtypes = [w.HWND, ctypes.c_int]
-user32.DestroyWindow.argtypes = [w.HWND]
 user32.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
 user32.MonitorFromWindow.argtypes = [w.HWND, w.DWORD]
 user32.MonitorFromWindow.restype = w.HANDLE
@@ -105,7 +99,8 @@ class StatusPopup:
         if self.mode == 'recording':
             d.ellipse(box((12, 14, 48, 50)), fill='#484848')
             d.ellipse(box((152, 14, 188, 50)), fill='white')
-            line((23, 25, 37, 39)); line((37, 25, 23, 39))
+            line((23, 25, 37, 39))
+            line((37, 25, 23, 39))
             line((162, 32, 168, 38, 179, 26), '#111111', 3)
             special = getattr(self, 'workflow', 'dictate') != 'dictate'
             if special:

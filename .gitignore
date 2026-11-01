@@ -3,3 +3,16 @@ models/
 __pycache__/
 settings.json
 .env*
+*.py[cod]
+*.log
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

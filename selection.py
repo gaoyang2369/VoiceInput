@@ -22,7 +22,7 @@ MAX_SELECTION = 20000
 @dataclass(frozen=True)
 class SelectionSnapshot:
     text: str
-    anchor: tuple
+    anchor: tuple | None
 
 
 def cursor_anchor():
@@ -94,7 +94,8 @@ def read_uia_selection():
                                  '-STA', '-EncodedCommand', encoded],
                                 capture_output=True, encoding='utf-8-sig', timeout=5,
                                 creationflags=subprocess.CREATE_NO_WINDOW)
-        return json.loads(result.stdout) if result.returncode == 0 else {}
+        selected = json.loads(result.stdout) if result.returncode == 0 else {}
+        return selected if isinstance(selected, dict) else {}
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return {}
 
