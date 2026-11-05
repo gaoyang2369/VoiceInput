@@ -5,6 +5,7 @@ settings.json
 .env*
 *.py[cod]
 *.log
+*.log.[0-9]*
 .pytest_cache/
 .ruff_cache/
 .coverage

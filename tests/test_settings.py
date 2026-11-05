@@ -24,4 +24,11 @@ class SettingsTests(unittest.TestCase):
             path.write_text('{"polish":false,"auto_paste":false,"model":" custom-model ","microphone":"mic"}',
                             encoding='utf-8')
             self.assertEqual(load_settings(path), {
-                'polish': False, 'auto_paste': False, 'model': 'custom-model', 'microphone': 'mic'})
+                'polish': False, 'auto_paste': False, 'model': 'custom-model', 'microphone': 'mic',
+                'vocabulary': []})
+
+    def test_vocabulary_loads_with_invalid_entries_filtered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            path.write_text('{"vocabulary":[" 接口 ",null,"VoiceInput","接口"]}', encoding='utf-8')
+            self.assertEqual(load_settings(path)['vocabulary'], ['接口', 'VoiceInput'])

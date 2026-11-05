@@ -1,11 +1,13 @@
 """Recording workflow checks with fake audio/ASR/cleanup; no external requests."""
 import time
+import tempfile
+from pathlib import Path
 import tkinter as tk
 import unittest
 from unittest.mock import MagicMock, patch, call
 
 import numpy as np
-from app import App
+from app import App, load_settings
 from selection import SelectionSnapshot
 
 
@@ -204,6 +206,48 @@ class RecordingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '整理失败'):
                 self.app.answer_filtered('嗯原始问题', '材料', 'test-key', 'test-model')
             answer.assert_not_called()
+
+    def test_dictation_question_only_cleans_and_never_answers(self):
+        with patch('app.cleanup', return_value='这段代码是什么意思？') as cleanup, \
+             patch('app.answer_question') as answer:
+            self.assertEqual(self.app.process_text('这段代码是什么意思', 'dictate', '代码', 'key', 'model'),
+                             ('这段代码是什么意思', '这段代码是什么意思？'))
+            cleanup.assert_called_once()
+            answer.assert_not_called()
+
+    def test_vocabulary_reaches_recording_and_edited_retry(self):
+        self.app.key_var.set('test-key')
+        self.app.vocabulary_input.insert('1.0', '接口\nVoiceInput')
+        self.start_recording()
+        self.app.should_paste = False
+        self.app.frames = [np.ones((8000, 1), dtype=np.float32) * 0.1]
+        self.app.engine = MagicMock()
+        self.app.engine.transcribe.return_value = '这个接扣'
+        with patch('app.cleanup', return_value='这个接口。') as cleanup:
+            self.app.stop()
+            self.wait_idle()
+            cleanup.assert_called_once_with('这个接扣', 'test-key', self.app.model.get(),
+                                            vocabulary=['接口', 'VoiceInput'])
+        self.app.vocabulary_input.insert('end', '\nDeepSeek')
+        with patch('app.cleanup', return_value='这个接口。') as cleanup:
+            self.app.retry()
+            self.wait_idle()
+            self.assertEqual(cleanup.call_args.kwargs['vocabulary'], ['接口', 'VoiceInput', 'DeepSeek'])
+
+    def test_vocabulary_reaches_question_cleanup_only(self):
+        with patch('app.cleanup', return_value='这个接口是什么意思？') as cleanup, \
+             patch('app.answer_question', return_value='答案') as answer:
+            self.app.process_text('这个接扣是什么意思', 'ask', '材料', 'key', 'model', vocabulary=['接口'])
+            cleanup.assert_called_once_with('这个接扣是什么意思', 'key', 'model', vocabulary=['接口'])
+            answer.assert_called_once_with('这个接口是什么意思？', '材料', 'key', 'model')
+
+    def test_save_settings_persists_normalized_vocabulary(self):
+        self.app.vocabulary_input.insert('1.0', ' 接口 \nVoiceInput\n接口\n')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            with patch('app.CONFIG', path):
+                self.app.save_settings()
+            self.assertEqual(load_settings(path)['vocabulary'], ['接口', 'VoiceInput'])
 
     def test_empty_cleaned_question_is_not_submitted(self):
         with patch('app.cleanup', return_value='  \n'), patch('app.answer_question') as answer:

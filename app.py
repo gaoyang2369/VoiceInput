@@ -2,6 +2,8 @@
 import ctypes
 from ctypes import wintypes
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import queue
@@ -14,7 +16,7 @@ import sounddevice as sd
 import keyring
 import pyperclip
 from pynput import keyboard
-from core import ROOT, DEFAULT_MODEL, Transcriber, cleanup, translate_english, answer_question, download_model, model_ready
+from core import ROOT, DEFAULT_MODEL, Transcriber, cleanup, translate_english, answer_question, download_model, model_ready, normalize_vocabulary
 from desktop import GlobalShortcut, StatusPopup, AnswerWindow, Tray, enable_dpi_awareness
 from selection import capture_selection
 
@@ -39,6 +41,7 @@ def load_settings(path=CONFIG):
         'microphone': microphone if isinstance(microphone, str) else '',
         'polish': settings.get('polish') if isinstance(settings.get('polish'), bool) else True,
         'auto_paste': settings.get('auto_paste') if isinstance(settings.get('auto_paste'), bool) else True,
+        'vocabulary': normalize_vocabulary(settings.get('vocabulary')),
     }
 
 
@@ -70,8 +73,8 @@ class App:
             pass
         settings = load_settings()
         root.title('轻声输入 · 本地识别 + DeepSeek')
-        root.geometry('820x790')
-        root.minsize(680, 620)
+        root.geometry('820x880')
+        root.minsize(680, 760)
         style = ttk.Style()
         style.theme_use('clam')
         style.configure('TLabel', font=('Microsoft YaHei UI', 10))
@@ -115,6 +118,10 @@ class App:
         self.mic.pack(side='left', fill='x', expand=True, padx=10)
         self.download_button = ttk.Button(row, text='下载语音模型', command=self.download)
         self.download_button.pack(side='left')
+        ttk.Label(panel, text='常用词（每行一个；整理时参考，如人名、项目名、专业术语）').pack(anchor='w')
+        self.vocabulary_input = tk.Text(panel, height=2, wrap='word', font=('Microsoft YaHei UI', 10))
+        self.vocabulary_input.insert('1.0', '\n'.join(settings.get('vocabulary', [])))
+        self.vocabulary_input.pack(fill='x', pady=(4, 8))
         self.record_button = ttk.Button(panel, text='开始录音   右 Alt', command=self.toggle)
         self.record_button.pack(fill='x', pady=4)
         self.status = tk.StringVar(value='就绪' if model_ready() else '首次使用：先下载语音模型，再保存 DeepSeek 密钥。')
@@ -168,7 +175,12 @@ class App:
     def save_settings(self):
         CONFIG.write_text(json.dumps({'model': self.model.get().strip(),
             'auto_paste': self.auto.get(), 'polish': self.polish.get(),
+            'vocabulary': self.read_vocabulary(),
             'microphone': self.mic.get()}, ensure_ascii=False), 'utf-8')
+
+    def read_vocabulary(self):
+        # Snapshot Tk data on the main thread before starting a worker.
+        return normalize_vocabulary(self.vocabulary_input.get('1.0', 'end-1c'))
 
     def save_key(self):
         value = self.key_var.get().strip()
@@ -218,13 +230,14 @@ class App:
             finally:
                 stream.close()
 
-    def process_text(self, text, workflow, context, api_key, model, polish=True):
+    def process_text(self, text, workflow, context, api_key, model, polish=True, vocabulary=()):
         """Shared routing for a new recording and an edited-transcript retry."""
         if workflow == 'translate':
             return text, translate_english(text, api_key, model)
         if workflow == 'ask':
-            return self.answer_filtered(text, context, api_key, model)
-        return text, cleanup(text, api_key, model) if polish else text
+            return self.answer_filtered(text, context, api_key, model, vocabulary)
+        options = {'vocabulary': vocabulary} if vocabulary else {}
+        return text, cleanup(text, api_key, model, **options) if polish else text
 
     def prepare_question(self, target, operation):
         self.set_busy(True)
@@ -347,6 +360,7 @@ class App:
         self.replace(self.raw, '')
         self.replace(self.result, '')
         do_polish = self.polish.get()
+        vocabulary = self.read_vocabulary()
         workflow, context = self.workflow, self.selected_text
         self.result_caption.set({'dictate': '整理结果（自动分段 / 列点）',
                                  'translate': '英文译文', 'ask': '选中文本问答 · 答案'}[workflow])
@@ -374,17 +388,18 @@ class App:
                 self.events.put(('processing', '正在整理文字…'))
             stage = {'dictate': '整理', 'translate': '翻译成英文', 'ask': '回答问题'}[workflow]
             self.events.put(('status', f'本地识别 {elapsed:.1f} 秒；' + (f'DeepSeek {stage}中…' if needs_model else '完成。')))
-            question, final = self.process_text(text, workflow, context, api_key, model, do_polish)
+            question, final = self.process_text(text, workflow, context, api_key, model, do_polish, vocabulary)
             self.events.put(('result', final))
             self.events.put(('done', (final, paste, target, elapsed, self.audio_warning, workflow,
                                       question)))
         self.background(run)
 
-    def answer_filtered(self, text, context, api_key, model):
+    def answer_filtered(self, text, context, api_key, model, vocabulary=()):
         # Keep the raw transcript editable; only the cleaned question reaches Q&A
         # and the result card. A cleanup failure must not silently bypass this step.
         self.events.put(('status', '正在整理口述问题…'))
-        question = cleanup(text, api_key, model).strip()
+        options = {'vocabulary': vocabulary} if vocabulary else {}
+        question = cleanup(text, api_key, model, **options).strip()
         if not question:
             raise RuntimeError('问题整理后为空，请检查识别原文再重试。')
         self.events.put(('status', '问题整理完成，正在根据选中文本回答…'))
@@ -400,10 +415,11 @@ class App:
         api_key = self.key_var.get().strip()
         model = self.model.get().strip()
         workflow, context = self.last_workflow, self.last_context
+        vocabulary = self.read_vocabulary()
         self.status.set('DeepSeek 正在重试上次任务…')
         self.popup.processing()
         def run():
-            question, final = self.process_text(text, workflow, context, api_key, model)
+            question, final = self.process_text(text, workflow, context, api_key, model, vocabulary=vocabulary)
             self.events.put(('result', final))
             self.events.put(('polished', (workflow, question, final)))
         self.background(run)
@@ -573,6 +589,17 @@ if __name__ == '__main__':
     if kernel32.GetLastError() == 183:
         kernel32.SetEvent(settings_event)
     else:
+        # Log only mode, prompt version, duration and outcome; never dictated text or keys.
+        logger = logging.getLogger('voiceinput')
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        try:
+            handler = RotatingFileHandler(ROOT / 'processing.log', maxBytes=1024 * 1024,
+                                          backupCount=2, encoding='utf-8')
+            handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+            logger.addHandler(handler)
+        except OSError:
+            logger.addHandler(logging.NullHandler())
         app = App(tk.Tk())
         app.settings_event = settings_event
         app.root.mainloop()
